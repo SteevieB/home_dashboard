@@ -8,36 +8,47 @@ def convert_german_number(value_str):
     """Convert German formatted number (1.234,56) to float"""
     return float(value_str.replace('.', '').replace(',', '.').replace('W', '').strip())
 
+# Start persistent browser at script initialization
+browser = None
+
+def init_browser():
+    global browser
+    if browser is None:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+
 def get_solar_data():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        url = "http://192.168.178.135"
+    global browser
+    if browser is None:
+        init_browser()
 
-        try:
-            page.goto(url)
-            page.wait_for_selector(".value")
+    page = browser.new_page()
+    url = "http://192.168.178.135"
 
-            dc_input = convert_german_number(
-                page.locator("xpath=//label[contains(text(), 'DC-Eingang')]/../div").inner_text()
-            )
-            output = convert_german_number(
-                page.locator("xpath=//label[contains(text(), 'Ausgangsleistung')]/../div").inner_text()
-            )
+    try:
+        page.goto(url)
+        page.wait_for_selector(".value")
 
-            data = {
-                'currentPower': output / 1000,  # Convert W to kW
-                'dailyEnergy': 0,  # You can add this if available from the website
-                'totalEnergy': 0   # You can add this if available from the website
-            }
+        dc_input = convert_german_number(
+            page.locator("xpath=//label[contains(text(), 'DC-Eingang')]/../div").inner_text()
+        )
+        output = convert_german_number(
+            page.locator("xpath=//label[contains(text(), 'Ausgangsleistung')]/../div").inner_text()
+        )
 
-            browser.close()
-            return data
+        data = {
+            'currentPower': output / 1000,  # Convert W to kW
+            'dailyEnergy': 0,  # You can add this if available from the website
+            'totalEnergy': 0   # You can add this if available from the website
+        }
 
-        except Exception as e:
-            print(f"Error accessing solar data: {e}")  # Add debugging
-            browser.close()
-            raise e
+        browser.close()
+        return data
+
+    except Exception as e:
+        print(f"Error accessing solar data: {e}")  # Add debugging
+        browser.close()
+        raise e
 
 if __name__ == "__main__":
     if "--once" in sys.argv:

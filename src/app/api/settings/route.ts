@@ -2,7 +2,7 @@
 import { NextResponse } from 'next/server'
 
 let pvSettings = {
-    minPower: 5,
+    minPower: 3,
     incrementPower: 2,
     maxTemp1: 60,
     maxTemp2: 55
