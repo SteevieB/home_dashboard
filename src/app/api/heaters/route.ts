@@ -1,23 +1,80 @@
 // app/api/heaters/route.ts
 import { NextResponse } from 'next/server'
+import { getLatestHeaterStates, updateHeaterState } from '@/lib/db'
+import { HeaterType } from '@/components/types'
 
-let waterHeaters = [
-    { id: 1, name: "Heizstab 1 - Phase 1", state: false },
-    { id: 2, name: "Heizstab 1 - Phase 2", state: false },
-    { id: 3, name: "Heizstab 1 - Phase 3", state: false },
-    { id: 4, name: "Heizstab 2 - Phase 1", state: false },
-    { id: 5, name: "Heizstab 2 - Phase 2", state: false },
-    { id: 6, name: "Heizstab 2 - Phase 3", state: false },
-]
+interface HeaterUpdateRequest {
+    id: number;
+    state: boolean;
+}
+
+interface HeaterResponse {
+    heaters: HeaterType[];
+    auto_mode: boolean;
+}
 
 export async function GET() {
-    return NextResponse.json(waterHeaters)
+    try {
+        const heaterStates = await getLatestHeaterStates();
+
+        if (!heaterStates) {
+            return NextResponse.json({
+                error: "Fehler beim Abrufen der Heizstab-Zustände"
+            }, { status: 500 });
+        }
+
+        const response: HeaterResponse = {
+            heaters: heaterStates,
+            auto_mode: false
+        };
+
+        return NextResponse.json(response);
+
+    } catch (error) {
+        console.error('API error:', error);
+        return NextResponse.json({
+            error: "Interner Server-Fehler"
+        }, { status: 500 });
+    }
 }
 
 export async function PATCH(request: Request) {
-    const data = await request.json()
-    waterHeaters = waterHeaters.map(heater =>
-        heater.id === data.id ? { ...heater, state: data.state } : heater
-    )
-    return NextResponse.json(waterHeaters)
+    try {
+        const data = await request.json() as HeaterUpdateRequest;
+
+        if (typeof data.id !== 'number' || typeof data.state !== 'boolean') {
+            return NextResponse.json({
+                error: "Ungültige Eingabedaten"
+            }, { status: 400 });
+        }
+
+        const success = await updateHeaterState(data.id, data.state);
+
+        if (!success) {
+            return NextResponse.json({
+                error: "Fehler beim Aktualisieren des Heizstab-Zustands"
+            }, { status: 500 });
+        }
+
+        const updatedStates = await getLatestHeaterStates();
+
+        if (!updatedStates) {
+            return NextResponse.json({
+                error: "Fehler beim Abrufen der aktualisierten Zustände"
+            }, { status: 500 });
+        }
+
+        const response: HeaterResponse = {
+            heaters: updatedStates,
+            auto_mode: false
+        };
+
+        return NextResponse.json(response);
+
+    } catch (error) {
+        console.error('API error:', error);
+        return NextResponse.json({
+            error: "Interner Server-Fehler"
+        }, { status: 500 });
+    }
 }

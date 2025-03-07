@@ -1,23 +1,41 @@
 // app/api/solar/route.ts
 import { NextResponse } from 'next/server'
-import { exec } from 'child_process'
-import { promisify } from 'util'
-
-const execAsync = promisify(exec)
+import { getLatestSolarStats } from '@/lib/db'
+import { SolarStatsType } from '@/components/types'
 
 export async function GET() {
     try {
-        // Execute Python script and get output
-        const { stdout } = await execAsync('python src/scripts/piko_scraper.py --once')
-        const data = JSON.parse(stdout)
-        return NextResponse.json(data)
+        const solarStats = await getLatestSolarStats();
+
+        if (!solarStats) {
+            // Fallback-Werte wenn keine Daten verfügbar
+            const errorData: SolarStatsType = {
+                currentPower: 0,
+                currentPowerUnit: 'W',
+                dailyEnergy: 0,
+                totalEnergy: 0
+            };
+            return NextResponse.json({ ...errorData, error: 'Keine Daten verfügbar' }, { status: 404 });
+        }
+
+        return NextResponse.json(solarStats);
+
     } catch (error) {
-        console.error('Failed to fetch solar data:', error)
-        return NextResponse.json({
+        console.error('Failed to fetch solar data:', error);
+
+        const errorData: SolarStatsType = {
             currentPower: 0,
+            currentPowerUnit: 'W',
             dailyEnergy: 0,
-            totalEnergy: 0,
-            error: 'Failed to fetch solar data'
-        }, { status: 500 })
+            totalEnergy: 0
+        };
+
+        return NextResponse.json(
+            {
+                ...errorData,
+                error: error instanceof Error ? error.message : 'Unknown error'
+            },
+            { status: 500 }
+        );
     }
 }

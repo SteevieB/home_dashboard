@@ -1,8 +1,8 @@
 import Image from "next/image";
-import HomeAutomationDashboard from "@/components/home-automation-dashboard";
+import Dashboard from "@/components/Dashboard";
 
 export default function Home() {
   return (
-    < HomeAutomationDashboard/>
+    < Dashboard/>
   );
 }
