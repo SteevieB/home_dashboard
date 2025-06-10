@@ -4,8 +4,17 @@ import { open, Database } from 'sqlite'
 import path from 'path'
 import { HeaterType, SensorType, PVSettingsType, SolarStatsType } from '@/components/types'
 
+// Database connection pool
 let db: Database | null = null;
+let dbInitialized = false;
 
+// In-memory cache
+const CACHE_TTL = 5000; // 5 seconds
+const cache: {[key: string]: {data: unknown, timestamp: number}} = {};
+
+/**
+ * Get database connection with optimized settings
+ */
 export async function getDb() {
     if (db) {
         return db;
@@ -16,24 +25,46 @@ export async function getDb() {
         driver: sqlite3.Database
     });
 
-    // Initialize settings table if needed
-    await initializeSettingsTable(db);
+    // Optimize database settings if not done yet
+    if (!dbInitialized) {
+        // Performance optimizations
+        await db.exec('PRAGMA journal_mode = WAL;'); // Write-Ahead Logging for better concurrency
+        await db.exec('PRAGMA synchronous = NORMAL;'); // Less sync to disk
+        await db.exec('PRAGMA cache_size = 10000;'); // Larger cache
+        await db.exec('PRAGMA temp_store = MEMORY;'); // Store temp tables and indices in memory
+
+        // Create indexes for commonly queried tables
+        await db.exec(`
+            CREATE INDEX IF NOT EXISTS idx_heater_states_timestamp ON heater_states(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_boiler_temps_timestamp ON boiler_temps(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_pv_power_timestamp ON pv_power(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_power_metrics_timestamp ON power_metrics(timestamp);
+        `);
+
+        // Initialize settings table
+        await initializeSettingsTable(db);
+
+        dbInitialized = true;
+    }
 
     return db;
 }
 
+/**
+ * Initialize settings table with default values
+ */
 async function initializeSettingsTable(db: Database) {
-    // Erstellen der Settings-Tabelle, falls nicht vorhanden
+    // Create settings table if it doesn't exist
     await db.exec(`
         CREATE TABLE IF NOT EXISTS settings (
-                                                key TEXT PRIMARY KEY,
-                                                value REAL NOT NULL,
-                                                description TEXT,
-                                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            key TEXT PRIMARY KEY,
+            value REAL NOT NULL,
+            description TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     `);
 
-    // Default-Werte einfügen, falls nicht vorhanden
+    // Insert default values if they don't exist
     const defaultSettings = [
         { key: 'minPower', value: 3, description: 'Minimale PV-Leistung in kW' },
         { key: 'incrementPower', value: 2, description: 'Leistungsinkrement in kW' },
@@ -49,25 +80,46 @@ async function initializeSettingsTable(db: Database) {
     }
 }
 
+/**
+ * Close database connection
+ */
 export async function closeDb() {
     if (db) {
         await db.close();
         db = null;
+        dbInitialized = false;
     }
+}
+
+/**
+ * Get cached data or fetch fresh data
+ */
+async function getCachedData<T>(cacheKey: string, fetchFn: () => Promise<T>): Promise<T> {
+    const now = Date.now();
+    const cachedItem = cache[cacheKey];
+
+    if (cachedItem && now - cachedItem.timestamp < CACHE_TTL) {
+        return cachedItem.data as T;
+    }
+
+    const data = await fetchFn();
+    cache[cacheKey] = { data, timestamp: now };
+    return data;
 }
 
 // Settings Operations
 export async function getSettings(): Promise<PVSettingsType> {
     try {
-        const db = await getDb();
-        const settings = await db.all('SELECT key, value FROM settings');
+        return await getCachedData('settings', async () => {
+            const db = await getDb();
+            const settings = await db.all('SELECT key, value FROM settings');
 
-        // Konvertiere Array von Einträgen in ein Objekt
-        return settings.reduce((acc, curr) => ({
-            ...acc,
-            [curr.key]: curr.value
-        }), {} as PVSettingsType);
-
+            // Convert array of entries to object
+            return settings.reduce((acc, curr) => ({
+                ...acc,
+                [curr.key]: curr.value
+            }), {} as PVSettingsType);
+        });
     } catch (error) {
         console.error('Error fetching settings:', error);
         throw error;
@@ -80,19 +132,20 @@ export async function updateSettings(updates: Partial<PVSettingsType>): Promise<
         await db.run('BEGIN TRANSACTION');
 
         for (const [key, value] of Object.entries(updates)) {
-            if (typeof value === 'number') {
-                await db.run(`
+            await db.run(`
                     UPDATE settings
                     SET value = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE key = ?
                 `, [value, key]);
-            }
         }
 
         await db.run('COMMIT');
-        return true;
 
+        // Invalidate cache
+        delete cache['settings'];
+
+        return true;
     } catch (error) {
         const db = await getDb();
         await db.run('ROLLBACK');
@@ -104,25 +157,31 @@ export async function updateSettings(updates: Partial<PVSettingsType>): Promise<
 // Heater Operations
 export async function getLatestHeaterStates(): Promise<HeaterType[] | null> {
     try {
-        const db = await getDb();
-        const result = await db.get(`
-            SELECT * FROM heater_states
-            ORDER BY timestamp DESC
-                LIMIT 1
-        `);
+        return await getCachedData('heaterStates', async () => {
+            const db = await getDb();
 
-        if (!result) {
-            return null;
-        }
+            // Optimized query with LIMIT before ORDER BY
+            const result = await db.get(`
+                SELECT * FROM (
+                    SELECT * FROM heater_states
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                )
+            `);
 
-        return [
-            { id: 1, name: "Heizstab 1 - Phase 1", state: Boolean(result.heater1_phase1) },
-            { id: 2, name: "Heizstab 1 - Phase 2", state: Boolean(result.heater1_phase2) },
-            { id: 3, name: "Heizstab 1 - Phase 3", state: Boolean(result.heater1_phase3) },
-            { id: 4, name: "Heizstab 2 - Phase 1", state: Boolean(result.heater2_phase1) },
-            { id: 5, name: "Heizstab 2 - Phase 2", state: Boolean(result.heater2_phase2) },
-            { id: 6, name: "Heizstab 2 - Phase 3", state: Boolean(result.heater2_phase3) }
-        ];
+            if (!result) {
+                return null;
+            }
+
+            return [
+                { id: 1, name: "Heizstab 1 - Phase 1", state: Boolean(result.heater1_phase1) },
+                { id: 2, name: "Heizstab 1 - Phase 2", state: Boolean(result.heater1_phase2) },
+                { id: 3, name: "Heizstab 1 - Phase 3", state: Boolean(result.heater1_phase3) },
+                { id: 4, name: "Heizstab 2 - Phase 1", state: Boolean(result.heater2_phase1) },
+                { id: 5, name: "Heizstab 2 - Phase 2", state: Boolean(result.heater2_phase2) },
+                { id: 6, name: "Heizstab 2 - Phase 3", state: Boolean(result.heater2_phase3) }
+            ];
+        });
     } catch (error) {
         console.error('Database error:', error);
         return null;
@@ -146,10 +205,10 @@ export async function updateHeaterState(id: number, state: boolean): Promise<boo
             throw new Error('Ungültige Heizstab-ID');
         }
 
+        // Optimized query - only update the changed column
         await db.run(`
             INSERT INTO heater_states (
                 timestamp,
-                ${column},
                 heater1_phase1,
                 heater1_phase2,
                 heater1_phase3,
@@ -159,17 +218,19 @@ export async function updateHeaterState(id: number, state: boolean): Promise<boo
             )
             SELECT
                 datetime('now'),
-                ?,
-                COALESCE(CASE WHEN '${column}' = 'heater1_phase1' THEN ? ELSE heater1_phase1 END, 0),
-                COALESCE(CASE WHEN '${column}' = 'heater1_phase2' THEN ? ELSE heater1_phase2 END, 0),
-                COALESCE(CASE WHEN '${column}' = 'heater1_phase3' THEN ? ELSE heater1_phase3 END, 0),
-                COALESCE(CASE WHEN '${column}' = 'heater2_phase1' THEN ? ELSE heater2_phase1 END, 0),
-                COALESCE(CASE WHEN '${column}' = 'heater2_phase2' THEN ? ELSE heater2_phase2 END, 0),
-                COALESCE(CASE WHEN '${column}' = 'heater2_phase3' THEN ? ELSE heater2_phase3 END, 0)
+                CASE WHEN '${column}' = 'heater1_phase1' THEN ? ELSE heater1_phase1 END,
+                CASE WHEN '${column}' = 'heater1_phase2' THEN ? ELSE heater1_phase2 END,
+                CASE WHEN '${column}' = 'heater1_phase3' THEN ? ELSE heater1_phase3 END,
+                CASE WHEN '${column}' = 'heater2_phase1' THEN ? ELSE heater2_phase1 END,
+                CASE WHEN '${column}' = 'heater2_phase2' THEN ? ELSE heater2_phase2 END,
+                CASE WHEN '${column}' = 'heater2_phase3' THEN ? ELSE heater2_phase3 END
             FROM heater_states
             ORDER BY timestamp DESC
-                LIMIT 1
-        `, [state ? 1 : 0, state ? 1 : 0, state ? 1 : 0, state ? 1 : 0, state ? 1 : 0, state ? 1 : 0, state ? 1 : 0]);
+            LIMIT 1
+        `, [state ? 1 : 0, state ? 1 : 0, state ? 1 : 0, state ? 1 : 0, state ? 1 : 0, state ? 1 : 0]);
+
+        // Invalidate cache
+        delete cache['heaterStates'];
 
         return true;
     } catch (error) {
@@ -179,6 +240,7 @@ export async function updateHeaterState(id: number, state: boolean): Promise<boo
 }
 
 // Sensor Operations
+// Cached static sensor data
 const staticSensorData: SensorType[] = [
     { id: 3, name: "Wohnzimmer", temperature: 22.5 },
     { id: 4, name: "Schlafzimmer", temperature: 21.0 },
@@ -187,27 +249,31 @@ const staticSensorData: SensorType[] = [
 
 export async function getLatestSensorData(): Promise<SensorType[] | null> {
     try {
-        const db = await getDb();
-        const result = await db.get(`
-            SELECT boiler1_temp, boiler2_temp
-            FROM boiler_temps
-            ORDER BY timestamp DESC
-                LIMIT 1
-        `);
+        return await getCachedData('sensorData', async () => {
+            const db = await getDb();
 
-        if (!result) {
-            return null;
-        }
+            // Optimized query
+            const result = await db.get(`
+                SELECT boiler1_temp, boiler2_temp FROM (
+                    SELECT boiler1_temp, boiler2_temp
+                    FROM boiler_temps
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                )
+            `);
 
-        const boilerData: SensorType[] = [
-            { id: 1, name: "Boiler 1", temperature: result.boiler1_temp },
-            { id: 2, name: "Boiler 2", temperature: result.boiler2_temp }
-        ];
+            if (!result) {
+                return null;
+            }
 
-        // Kombiniere Boiler-Daten mit statischen Sensor-Daten
-        return [...boilerData, ...staticSensorData];
+            const boilerData: SensorType[] = [
+                { id: 1, name: "Boiler 1", temperature: result.boiler1_temp },
+                { id: 2, name: "Boiler 2", temperature: result.boiler2_temp }
+            ];
 
-
+            // Combine boiler data with static sensor data
+            return [...boilerData, ...staticSensorData];
+        });
     } catch (error) {
         console.error('Database error:', error);
         return null;
@@ -217,39 +283,90 @@ export async function getLatestSensorData(): Promise<SensorType[] | null> {
 // Solar Operations
 export async function getLatestSolarStats(): Promise<SolarStatsType | null> {
     try {
-        const db = await getDb();
+        return await getCachedData('solarStats', async () => {
+            const db = await getDb();
 
-        const latestPower = await db.get(`
-            SELECT 
-                power_kw,
-                timestamp,
-                (
-                    SELECT SUM(power_kw) / 60.0  -- Umrechnung von kW pro Minute in kWh
+            // Optimized query using a subquery
+            const latestPower = await db.get(`
+                WITH daily_sum AS (
+                    SELECT SUM(power_kw) / 60.0 as daily_energy
                     FROM pv_power 
                     WHERE DATE(timestamp) = DATE('now', 'localtime')
-                ) as daily_energy,
-                (
-                    SELECT SUM(power_kw) / 60.0  -- Gesamtenergie in kWh
+                ),
+                total_sum AS (
+                    SELECT SUM(power_kw) / 60.0 as total_energy
                     FROM pv_power
-                ) as total_energy
-            FROM pv_power 
-            ORDER BY timestamp DESC 
-            LIMIT 1
-        `);
+                ),
+                latest AS (
+                    SELECT power_kw, timestamp
+                    FROM pv_power 
+                    ORDER BY timestamp DESC 
+                    LIMIT 1
+                )
+                SELECT 
+                    latest.power_kw,
+                    latest.timestamp,
+                    daily_sum.daily_energy,
+                    total_sum.total_energy
+                FROM latest, daily_sum, total_sum
+            `);
 
-        if (!latestPower) {
-            return null;
-        }
+            if (!latestPower) {
+                return null;
+            }
 
-        return {
-            currentPower: latestPower.power_kw * 1000, // Umrechnung von kW in W
-            currentPowerUnit: 'W',
-            dailyEnergy: Number(latestPower.daily_energy.toFixed(2)),
-            totalEnergy: Number(latestPower.total_energy.toFixed(2))
-        };
-
+            return {
+                currentPower: latestPower.power_kw * 1000, // Convert kW to W
+                currentPowerUnit: 'W',
+                dailyEnergy: Number(latestPower.daily_energy.toFixed(2)),
+                totalEnergy: Number(latestPower.total_energy.toFixed(2))
+            };
+        });
     } catch (error) {
         console.error('Database error:', error);
         return null;
+    }
+}
+
+// Power Metrics
+export async function getLatestPowerMetrics() {
+    try {
+        return await getCachedData('powerMetrics', async () => {
+            const db = await getDb();
+
+            const result = await db.get(`
+                SELECT 
+                    aktuelle_leistung,
+                    verbrauch,
+                    einspeisung
+                FROM (
+                    SELECT *
+                    FROM power_metrics 
+                    ORDER BY timestamp DESC 
+                    LIMIT 1
+                )
+            `);
+
+            if (!result) {
+                return {
+                    aktuelle_leistung: 0,
+                    verbrauch: 0,
+                    einspeisung: 0
+                };
+            }
+
+            return {
+                aktuelle_leistung: Math.round(Number(result.aktuelle_leistung)),
+                verbrauch: Number(result.verbrauch),
+                einspeisung: Number(result.einspeisung)
+            };
+        });
+    } catch (error) {
+        console.error('Failed to fetch power metrics:', error);
+        return {
+            aktuelle_leistung: 0,
+            verbrauch: 0,
+            einspeisung: 0
+        };
     }
 }
